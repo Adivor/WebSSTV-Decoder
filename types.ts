@@ -13,10 +13,11 @@ export interface SSTVModeConfig {
   id: SSTVModeId;
   width: number;
   height: number;
-  lineTime: number; // ms
-  syncTime: number; // ms
+  channelTime: number; // ms per singolo colore
+  syncTime: number; // ms impulso sincro
+  gapTime: number; // ms gap tra canali
   numChannels: number;
-  visCode: number;
+  colorOrder: ('R' | 'G' | 'B')[];
 }
 
 export enum DecoderStatus {
@@ -35,7 +36,11 @@ export interface AIAnalysisResult {
   callsign?: string;
   operatorName?: string;
   location?: string;
+  gridLocator?: string;
   report?: string;
+  frequency?: string;
+  mode?: string;
+  technicalDetails?: string;
   otherInfo?: string;
   rawSummary?: string;
 }
@@ -44,6 +49,7 @@ export interface HistoryItem {
   id: string;
   timestamp: number;
   dataUrl: string;
+  cleanedDataUrl?: string; // Immagine processata dall'IA
   mode: SSTVModeId;
   aiAnalysis?: AIAnalysisResult;
 }

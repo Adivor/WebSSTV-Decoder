@@ -2,8 +2,10 @@
 export class AudioEngine {
   private audioCtx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
+  private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private stream: MediaStream | null = null;
+  private gainNode: GainNode | null = null;
   
   // DSP Nodes
   private bpfFilter: BiquadFilterNode | null = null;
@@ -14,12 +16,14 @@ export class AudioEngine {
   private bpfEnabled = false;
   private lmsEnabled = false;
   private noiseReductionEnabled = false;
+  private currentGainPercent = 50;
+  private onFrequencyCallback: ((data: { freq: number; level: number }) => void) | null = null;
 
   static async getDevices(): Promise<MediaDeviceInfo[]> {
     try {
-      // First, request permission to ensure device labels are available
-      await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const devices = await navigator.mediaDevices.enumerateDevices();
+      stream.getTracks().forEach(t => t.stop());
       return devices.filter(device => device.kind === 'audioinput');
     } catch (err) {
       console.error('Error enumerating devices:', err);
@@ -27,8 +31,9 @@ export class AudioEngine {
     }
   }
 
-  async start(deviceId?: string): Promise<boolean> {
+  async start(deviceId?: string, onFreq?: (data: { freq: number; level: number }) => void): Promise<boolean> {
     try {
+      this.onFrequencyCallback = onFreq || null;
       const constraints: MediaStreamConstraints = {
         audio: deviceId ? { deviceId: { exact: deviceId } } : true
       };
@@ -36,29 +41,41 @@ export class AudioEngine {
       this.stream = await navigator.mediaDevices.getUserMedia(constraints);
       this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       
+      if (this.audioCtx.state === 'suspended') {
+        await this.audioCtx.resume();
+      }
+      
       this.analyser = this.audioCtx.createAnalyser();
-      this.analyser.fftSize = 4096;
+      this.analyser.fftSize = 2048; // Dimensione ridotta per maggiore reattività temporale
+      this.analyser.smoothingTimeConstant = 0;
       
+      this.processor = this.audioCtx.createScriptProcessor(1024, 1, 1);
+      this.processor.onaudioprocess = () => {
+        if (this.onFrequencyCallback) {
+          this.onFrequencyCallback(this.getFrequency());
+        }
+      };
+
       this.source = this.audioCtx.createMediaStreamSource(this.stream);
+      this.gainNode = this.audioCtx.createGain();
+      this.setGain(this.currentGainPercent);
       
-      // Initialize Filters
       this.bpfFilter = this.audioCtx.createBiquadFilter();
       this.bpfFilter.type = 'bandpass';
-      this.bpfFilter.frequency.value = 1700; // Center of SSTV range
-      this.bpfFilter.Q.value = 1.0;
+      this.bpfFilter.frequency.value = 1750; 
+      this.bpfFilter.Q.value = 1.5;
 
       this.lpfFilter = this.audioCtx.createBiquadFilter();
       this.lpfFilter.type = 'lowpass';
-      this.lpfFilter.frequency.value = 2400; // Cutoff above white frequency
+      this.lpfFilter.frequency.value = 2400; 
       this.lpfFilter.Q.value = 0.7;
 
       this.lmsNode = this.audioCtx.createDynamicsCompressor();
-      // Aggressive settings for "LMS-like" adaptive gain leveling
-      this.lmsNode.threshold.value = -30;
-      this.lmsNode.knee.value = 0;
-      this.lmsNode.ratio.value = 20;
-      this.lmsNode.attack.value = 0.005;
-      this.lmsNode.release.value = 0.050;
+      this.lmsNode.threshold.value = -40;
+      this.lmsNode.knee.value = 10;
+      this.lmsNode.ratio.value = 12;
+      this.lmsNode.attack.value = 0.003;
+      this.lmsNode.release.value = 0.25;
 
       this.rebuildChain();
       
@@ -69,15 +86,28 @@ export class AudioEngine {
     }
   }
 
+  setGain(percent: number) {
+    this.currentGainPercent = percent;
+    if (this.gainNode && this.audioCtx) {
+      const gainValue = (percent / 50);
+      this.gainNode.gain.setTargetAtTime(gainValue, this.audioCtx.currentTime, 0.01);
+    }
+  }
+
   private rebuildChain() {
-    if (!this.source || !this.bpfFilter || !this.lpfFilter || !this.lmsNode || !this.analyser) return;
+    if (!this.source || !this.gainNode || !this.bpfFilter || !this.lpfFilter || !this.lmsNode || !this.analyser || !this.processor) return;
 
     this.source.disconnect();
+    this.gainNode.disconnect();
     this.bpfFilter.disconnect();
     this.lpfFilter.disconnect();
     this.lmsNode.disconnect();
+    this.analyser.disconnect();
+    this.processor.disconnect();
 
     let lastNode: AudioNode = this.source;
+    lastNode.connect(this.gainNode);
+    lastNode = this.gainNode;
 
     if (this.noiseReductionEnabled) {
       lastNode.connect(this.lpfFilter);
@@ -95,14 +125,15 @@ export class AudioEngine {
     }
 
     lastNode.connect(this.analyser);
+    this.analyser.connect(this.processor);
+    this.processor.connect(this.audioCtx.destination);
   }
 
-  setBpf(enabled: boolean, width: 'narrow' | 'medium' | 'wide' = 'medium') {
+  setBpf(enabled: boolean, frequency: number, q: number) {
     this.bpfEnabled = enabled;
-    if (this.bpfFilter) {
-      // Adjust Q factor for width (Higher Q = Narrower Band)
-      const qValues = { narrow: 4.0, medium: 1.5, wide: 0.7 };
-      this.bpfFilter.Q.value = qValues[width];
+    if (this.bpfFilter && this.audioCtx) {
+      this.bpfFilter.frequency.setTargetAtTime(frequency, this.audioCtx.currentTime, 0.01);
+      this.bpfFilter.Q.setTargetAtTime(q, this.audioCtx.currentTime, 0.01);
     }
     this.rebuildChain();
   }
@@ -119,12 +150,17 @@ export class AudioEngine {
 
   stop() {
     this.stream?.getTracks().forEach(t => t.stop());
-    this.audioCtx?.close();
+    if (this.audioCtx) {
+      this.audioCtx.close();
+    }
     this.audioCtx = null;
     this.analyser = null;
+    this.processor = null;
+    this.gainNode = null;
     this.bpfFilter = null;
     this.lpfFilter = null;
     this.lmsNode = null;
+    this.onFrequencyCallback = null;
   }
 
   getFrequency(): { freq: number; level: number } {
@@ -147,6 +183,8 @@ export class AudioEngine {
       }
     }
 
+    if (maxIndex === -1) return { freq: 0, level: 0 };
+
     let freq = maxIndex * (this.audioCtx.sampleRate / 2) / bufferLength;
     if (maxIndex > 0 && maxIndex < bufferLength - 1) {
       const alpha = dataArray[maxIndex - 1];
@@ -156,7 +194,7 @@ export class AudioEngine {
       freq = (maxIndex + p) * (this.audioCtx.sampleRate / 2) / bufferLength;
     }
 
-    const level = Math.max(0, (maxVal + 100) / 100);
+    const level = Math.max(0, (maxVal + 90) / 60); 
     return { freq, level };
   }
 

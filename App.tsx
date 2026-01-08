@@ -10,180 +10,147 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 const App: React.FC = () => {
   const [isActive, setIsActive] = useState(false);
+  const [autoStart, setAutoStart] = useState(() => localStorage.getItem('sstv_autostart') === 'true');
+  const [autoSave, setAutoSave] = useState(() => (localStorage.getItem('sstv_autosave') || 'true') === 'true');
   const [selectedMode, setSelectedMode] = useState<SSTVModeId>(SSTVModeId.MARTIN1);
   const [status, setStatus] = useState<DecoderStatus>(DecoderStatus.IDLE);
   const [signal, setSignal] = useState({ freq: 0, level: 0 });
   const [fftData, setFftData] = useState<Uint8Array>(new Uint8Array(0));
+  const [inputGain, setInputGain] = useState(50);
   
-  // Audio Device States
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>(() => localStorage.getItem('sstv_device_id') || '');
   
-  // DSP States
   const [afcEnabled, setAfcEnabled] = useState(true);
   const [afcOffset, setAfcOffset] = useState(0);
   const [lmsEnabled, setLmsEnabled] = useState(false);
   const [bpfEnabled, setBpfEnabled] = useState(false);
-  const [bpfWidth, setBpfWidth] = useState<'narrow' | 'medium' | 'wide'>('medium');
+  const [bpfFrequency, setBpfFrequency] = useState(1750);
+  const [bpfQ, setBpfQ] = useState(1.5);
   const [noiseReductionEnabled, setNoiseReductionEnabled] = useState(false);
   
-  // Progress states
   const [progress, setProgress] = useState(0);
   const [currentLineDisplay, setCurrentLineDisplay] = useState(0);
+  const [showSaveFlash, setShowSaveFlash] = useState(false);
+  const [isCleaningCurrent, setIsCleaningCurrent] = useState(false);
 
-  // History states
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [cleaningId, setCleaningId] = useState<string | null>(null);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<AudioEngine>(new AudioEngine());
   const animationFrameRef = useRef<number | null>(null);
   
-  // Decoding state
-  const currentLineRef = useRef(0);
-  const currentPixelRef = useRef(0);
+  const isActiveRef = useRef(false);
+  const statusRef = useRef<DecoderStatus>(DecoderStatus.IDLE);
+  const selectedModeRef = useRef<SSTVModeId>(SSTVModeId.MARTIN1);
   const isDecodingRef = useRef(false);
   const imageBufferRef = useRef<ImageData | null>(null);
-
-  // Auto-detection robustness refs
+  const autoSaveRef = useRef(autoSave);
+  const pendingSaveRef = useRef(false);
+  
+  const lastLineStartTimeRef = useRef(0);
+  const currentLineRef = useRef(0);
   const leaderConfidenceRef = useRef(0);
   const syncConfidenceRef = useRef(0);
-  const lastStateResetRef = useRef(Date.now());
+  const syncDetectedInLineRef = useRef(false);
 
-  // Load history from localStorage on mount
   useEffect(() => {
-    const stored = localStorage.getItem('sstv_history');
-    if (stored) {
-      try {
-        setHistory(JSON.parse(stored));
-      } catch (e) {
-        console.error("Failed to load history", e);
-      }
-    }
-  }, []);
+    isActiveRef.current = isActive;
+    statusRef.current = status;
+    selectedModeRef.current = selectedMode;
+    autoSaveRef.current = autoSave;
+  }, [isActive, status, selectedMode, autoSave]);
 
-  // Fetch audio devices
   useEffect(() => {
-    const fetchDevices = async () => {
-      const audioDevices = await AudioEngine.getDevices();
-      setDevices(audioDevices);
-      if (audioDevices.length > 0 && !selectedDeviceId) {
-        setSelectedDeviceId(audioDevices[0].deviceId);
-      }
-    };
-    fetchDevices();
+    engineRef.current.setGain(inputGain);
+  }, [inputGain]);
+
+  useEffect(() => {
+    engineRef.current.setBpf(bpfEnabled, bpfFrequency, bpfQ);
+  }, [bpfEnabled, bpfFrequency, bpfQ]);
+
+  useEffect(() => {
+    engineRef.current.setLms(lmsEnabled);
+  }, [lmsEnabled]);
+
+  useEffect(() => {
+    engineRef.current.setNoiseReduction(noiseReductionEnabled);
+  }, [noiseReductionEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem('sstv_autostart', String(autoStart));
+  }, [autoStart]);
+
+  useEffect(() => {
+    localStorage.setItem('sstv_autosave', String(autoSave));
+  }, [autoSave]);
+
+  useEffect(() => {
+    if (selectedDeviceId) localStorage.setItem('sstv_device_id', selectedDeviceId);
   }, [selectedDeviceId]);
 
-  // Save history to localStorage whenever it changes
   useEffect(() => {
-    localStorage.setItem('sstv_history', JSON.stringify(history));
-  }, [history]);
+    const stored = localStorage.getItem('sstv_history');
+    if (stored) try { setHistory(JSON.parse(stored)); } catch (e) { console.error(e); }
+    
+    const init = async () => {
+      const audioDevices = await AudioEngine.getDevices();
+      setDevices(audioDevices);
+      const dev = selectedDeviceId || (audioDevices.length > 0 ? audioDevices[0].deviceId : '');
+      if (dev) setSelectedDeviceId(dev);
 
-  // Sync DSP state to engine
-  useEffect(() => {
-    if (isActive) {
-      engineRef.current.setBpf(bpfEnabled, bpfWidth);
-      engineRef.current.setLms(lmsEnabled);
-      engineRef.current.setNoiseReduction(noiseReductionEnabled);
-    }
-  }, [isActive, bpfEnabled, bpfWidth, lmsEnabled, noiseReductionEnabled]);
+      if (autoStart && dev) {
+        startEngine(dev);
+      }
+    };
+    init();
+    return () => engineRef.current.stop();
+  }, []);
 
   const saveToHistory = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     
+    // Trigger flash effect
+    setShowSaveFlash(true);
+    setTimeout(() => setShowSaveFlash(false), 300);
+
     const dataUrl = canvas.toDataURL('image/png');
     const newItem: HistoryItem = {
       id: Date.now().toString(),
       timestamp: Date.now(),
       dataUrl,
-      mode: selectedMode === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedMode
+      mode: selectedModeRef.current === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedModeRef.current
     };
-
-    setHistory(prev => [newItem, ...prev].slice(0, 50)); // Limit to 50 items
-  }, [selectedMode]);
-
-  const runAIAnalysis = async (item: HistoryItem) => {
-    if (analyzingId) return;
-    setAnalyzingId(item.id);
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const base64Data = item.dataUrl.split(',')[1];
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: [
-          {
-            parts: [
-              { text: "Analyze this amateur radio SSTV image. Extract the callsign, operator name, signal report (RST), and location if visible. Return the results in structured JSON format." },
-              { inlineData: { mimeType: "image/png", data: base64Data } }
-            ]
-          }
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              callsign: { type: Type.STRING, description: "Amateur radio callsign found in the image (e.g. K1ABC, I0XXX)" },
-              operatorName: { type: Type.STRING, description: "Name of the person mentioned" },
-              location: { type: Type.STRING, description: "City, Country or Grid Square" },
-              report: { type: Type.STRING, description: "Signal report (e.g. 599)" },
-              otherInfo: { type: Type.STRING, description: "Any other relevant radio text found" },
-              rawSummary: { type: Type.STRING, description: "Brief description of the image content" }
-            }
-          }
-        }
-      });
-
-      const analysisResult: AIAnalysisResult = JSON.parse(response.text || '{}');
-      
-      setHistory(prev => prev.map(h => 
-        h.id === item.id ? { ...h, aiAnalysis: analysisResult } : h
-      ));
-
-    } catch (error) {
-      console.error("AI Analysis failed:", error);
-      alert("AI Analysis failed. Check console for details.");
-    } finally {
-      setAnalyzingId(null);
-    }
-  };
-
-  const deleteFromHistory = (id: string) => {
-    setHistory(prev => prev.filter(item => item.id !== id));
-  };
-
-  const clearHistory = () => {
-    if (window.confirm("Are you sure you want to clear all decoded images?")) {
-      setHistory([]);
-    }
-  };
-
-  const downloadHistoryItem = (item: HistoryItem) => {
-    const link = document.createElement('a');
-    link.download = `sstv_${item.mode.replace(/\s+/g, '_')}_${new Date(item.timestamp).toISOString()}.png`;
-    link.href = item.dataUrl;
-    link.click();
-  };
+    
+    setHistory(prev => {
+      const updated = [newItem, ...prev].slice(0, 50);
+      localStorage.setItem('sstv_history', JSON.stringify(updated));
+      return updated;
+    });
+  }, []);
 
   const startDecoding = useCallback((modeId: SSTVModeId) => {
-    const mode = MODES[modeId] || MODES[SSTVModeId.MARTIN1];
+    const targetMode = modeId === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : modeId;
+    const mode = MODES[targetMode] || MODES[SSTVModeId.MARTIN1];
     setStatus(DecoderStatus.RECEIVING);
     isDecodingRef.current = true;
     currentLineRef.current = 0;
-    currentPixelRef.current = 0;
+    lastLineStartTimeRef.current = performance.now();
+    syncDetectedInLineRef.current = true;
     setProgress(0);
     setCurrentLineDisplay(0);
+    pendingSaveRef.current = false;
     
     const canvas = canvasRef.current;
     if (canvas) {
+      canvas.width = mode.width;
+      canvas.height = mode.height;
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        canvas.width = mode.width;
-        canvas.height = mode.height;
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, mode.width, mode.height);
         imageBufferRef.current = ctx.createImageData(mode.width, mode.height);
@@ -191,10 +158,117 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const handleModeSelect = (mode: SSTVModeId) => {
-    setSelectedMode(mode);
-    if (mode === SSTVModeId.AUTO) {
+  const stopDecoding = useCallback(() => {
+    isDecodingRef.current = false;
+    setStatus(DecoderStatus.IDLE);
+    pendingSaveRef.current = false;
+  }, []);
+
+  const processAudioFrequency = (data: { freq: number; level: number }) => {
+    if (!isActiveRef.current) return;
+
+    setSignal(data);
+
+    const isSync = Math.abs(data.freq - (FREQ_SYNC + afcOffset)) < 60 && data.level > 0.15;
+
+    if (statusRef.current === DecoderStatus.LISTENING) {
+      const isLeader = Math.abs(data.freq - (FREQ_VIS_LEADER + afcOffset)) < 60 && data.level > 0.2;
+      if (isLeader) leaderConfidenceRef.current++;
+      else if (isSync && leaderConfidenceRef.current > 5) syncConfidenceRef.current++;
+      
+      if (leaderConfidenceRef.current > 10 && syncConfidenceRef.current > 4) {
+        leaderConfidenceRef.current = 0;
+        syncConfidenceRef.current = 0;
+        startDecoding(selectedModeRef.current);
+      }
+    }
+
+    if (isDecodingRef.current && imageBufferRef.current) {
+      const mId = selectedModeRef.current === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedModeRef.current;
+      const mode = MODES[mId];
+      const now = performance.now();
+      
+      if (isSync && !syncDetectedInLineRef.current) {
+        lastLineStartTimeRef.current = now;
+        syncDetectedInLineRef.current = true;
+      }
+
+      if (syncDetectedInLineRef.current) {
+        const timeInLine = now - lastLineStartTimeRef.current - mode.syncTime;
+        
+        if (timeInLine >= 0) {
+          const totalLineTime = (mode.channelTime + mode.gapTime) * mode.numChannels;
+          
+          if (timeInLine > totalLineTime) {
+            currentLineRef.current++;
+            syncDetectedInLineRef.current = false;
+            
+            if (currentLineRef.current >= mode.height) {
+              isDecodingRef.current = false;
+              // Segnaliamo al loop di rendering che dobbiamo salvare l'immagine
+              pendingSaveRef.current = true;
+            }
+          } else {
+            const channelIndex = Math.floor(timeInLine / (mode.channelTime + mode.gapTime));
+            const timeInChannel = timeInLine % (mode.channelTime + mode.gapTime);
+            
+            if (timeInChannel <= mode.channelTime && channelIndex < mode.numChannels) {
+              const x = Math.floor((timeInChannel / mode.channelTime) * mode.width);
+              if (x >= 0 && x < mode.width) {
+                const color = mode.colorOrder[channelIndex];
+                const val = Math.max(0, Math.min(255, ((data.freq - afcOffset - FREQ_BLACK) / (FREQ_WHITE - FREQ_BLACK)) * 255));
+                
+                const pixelIdx = (currentLineRef.current * mode.width + x) * 4;
+                if (pixelIdx >= 0 && pixelIdx < imageBufferRef.current.data.length) {
+                  if (color === 'R') imageBufferRef.current.data[pixelIdx] = val;
+                  else if (color === 'G') imageBufferRef.current.data[pixelIdx + 1] = val;
+                  else if (color === 'B') imageBufferRef.current.data[pixelIdx + 2] = val;
+                  imageBufferRef.current.data[pixelIdx + 3] = 255;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const loop = () => {
+    if (!isActiveRef.current) return;
+    setFftData(engineRef.current.getByteFrequencyData());
+
+    if (imageBufferRef.current && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.putImageData(imageBufferRef.current, 0, 0);
+      }
+
+      if (isDecodingRef.current) {
+        const mId = selectedModeRef.current === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedModeRef.current;
+        const mode = MODES[mId];
+        setProgress((currentLineRef.current / mode.height) * 100);
+        setCurrentLineDisplay(currentLineRef.current);
+      }
+
+      // Se abbiamo finito di ricevere e dobbiamo salvare
+      if (pendingSaveRef.current) {
+        pendingSaveRef.current = false;
+        setStatus(DecoderStatus.IDLE);
+        if (autoSaveRef.current) {
+          saveToHistory();
+        }
+      }
+    }
+    animationFrameRef.current = requestAnimationFrame(loop);
+  };
+
+  const startEngine = async (deviceId: string) => {
+    const ok = await engineRef.current.start(deviceId, processAudioFrequency);
+    if (ok) {
+      setIsActive(true);
+      isActiveRef.current = true;
       setStatus(DecoderStatus.LISTENING);
+      animationFrameRef.current = requestAnimationFrame(loop);
     }
   };
 
@@ -202,314 +276,341 @@ const App: React.FC = () => {
     if (isActive) {
       engineRef.current.stop();
       setIsActive(false);
+      isActiveRef.current = false;
       setStatus(DecoderStatus.IDLE);
-      setAfcOffset(0);
-      setProgress(0);
-      setCurrentLineDisplay(0);
-      leaderConfidenceRef.current = 0;
-      syncConfidenceRef.current = 0;
-      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
     } else {
-      const success = await engineRef.current.start(selectedDeviceId);
-      if (success) {
-        setIsActive(true);
-        setStatus(selectedMode === SSTVModeId.AUTO ? DecoderStatus.LISTENING : DecoderStatus.LISTENING);
-        loop();
-      }
+      startEngine(selectedDeviceId);
     }
   };
 
-  const loop = () => {
-    const data = engineRef.current.getFrequency();
-    
-    // 1. AFC Logic
-    if (afcEnabled && Math.abs(data.freq - (FREQ_SYNC + afcOffset)) < 60 && data.level > 0.3) {
-      const measuredOffset = data.freq - FREQ_SYNC;
-      setAfcOffset(prev => prev * 0.9 + measuredOffset * 0.1);
-    }
-
-    setSignal(data);
-    setFftData(engineRef.current.getByteFrequencyData());
-
-    // --- REFINED AUTO-DETECTION LOGIC ---
-    if (status !== DecoderStatus.RECEIVING) {
-      const isLeaderFreq = Math.abs(data.freq - (FREQ_VIS_LEADER + afcOffset)) < 40 && data.level > 0.15;
-      const isSyncFreq = Math.abs(data.freq - (FREQ_SYNC + afcOffset)) < 40 && data.level > 0.15;
-
-      // Every 2 seconds of silence/garbage, reset detection state
-      if (Date.now() - lastStateResetRef.current > 2000) {
-        leaderConfidenceRef.current = 0;
-        syncConfidenceRef.current = 0;
-        lastStateResetRef.current = Date.now();
-      }
-
-      if (isLeaderFreq) {
-        leaderConfidenceRef.current++;
-        lastStateResetRef.current = Date.now();
-      } else if (isSyncFreq && leaderConfidenceRef.current > 10) {
-        syncConfidenceRef.current++;
-        lastStateResetRef.current = Date.now();
-      } else if (!isSyncFreq && !isLeaderFreq && data.level > 0.1) {
-        leaderConfidenceRef.current = Math.max(0, leaderConfidenceRef.current - 0.5);
-        syncConfidenceRef.current = Math.max(0, syncConfidenceRef.current - 0.5);
-      }
-
-      if (leaderConfidenceRef.current >= 15 && syncConfidenceRef.current >= 5) {
-        if (!isDecodingRef.current) {
-          leaderConfidenceRef.current = 0;
-          syncConfidenceRef.current = 0;
-          startDecoding(selectedMode === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedMode);
-        }
-      }
-    }
-
-    // 2. If decoding
-    if (isDecodingRef.current && imageBufferRef.current) {
-      const modeId = selectedMode === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedMode;
-      const mode = MODES[modeId];
+  const runAICleanCurrent = async () => {
+    if (!canvasRef.current || isCleaningCurrent) return;
+    setIsCleaningCurrent(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const dataUrl = canvasRef.current.toDataURL('image/png');
+      const base64Data = dataUrl.split(',')[1];
       
-      const correctedFreq = afcEnabled ? data.freq - afcOffset : data.freq;
-      let val = ((correctedFreq - FREQ_BLACK) / (FREQ_WHITE - FREQ_BLACK)) * 255;
-      val = Math.max(0, Math.min(255, val));
-
-      const idx = (currentLineRef.current * mode.width + currentPixelRef.current) * 4;
-      imageBufferRef.current.data[idx] = val;
-      imageBufferRef.current.data[idx + 1] = val;
-      imageBufferRef.current.data[idx + 2] = val;
-      imageBufferRef.current.data[idx + 3] = 255;
-
-      currentPixelRef.current++;
-      if (currentPixelRef.current >= mode.width) {
-        currentPixelRef.current = 0;
-        currentLineRef.current++;
-        setProgress((currentLineRef.current / mode.height) * 100);
-        setCurrentLineDisplay(currentLineRef.current);
-        
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const ctx = canvas.getContext('2d');
-          ctx?.putImageData(imageBufferRef.current, 0, 0);
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: 'image/png', data: base64Data } },
+            { text: "This is a noisy SSTV (Slow Scan Television) image. Please perform a deep restoration: remove all horizontal scanline interference, salt-and-pepper noise, and chromatic aberrations. Reconstruct any missing or fuzzy text like callsigns or signal reports to be sharp and legible. Return only the restored image." },
+          ],
         }
+      });
 
-        if (currentLineRef.current >= mode.height) {
-          isDecodingRef.current = false;
-          setStatus(DecoderStatus.IDLE);
-          setProgress(100);
-          saveToHistory();
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData) {
+          const img = new Image();
+          img.onload = () => {
+            if (canvasRef.current && imageBufferRef.current) {
+              const ctx = canvasRef.current.getContext('2d');
+              if (ctx) {
+                ctx.drawImage(img, 0, 0, canvasRef.current.width, canvasRef.current.height);
+                imageBufferRef.current = ctx.getImageData(0, 0, canvasRef.current.width, canvasRef.current.height);
+              }
+            }
+          };
+          img.src = `data:image/png;base64,${part.inlineData.data}`;
+          break;
         }
       }
+    } catch (error) {
+      console.error('AI Enhance failed:', error);
+    } finally {
+      setIsCleaningCurrent(false);
     }
-
-    animationFrameRef.current = requestAnimationFrame(loop);
   };
 
-  useEffect(() => {
-    return () => {
-      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
-      engineRef.current.stop();
-    };
-  }, []);
+  const runAIClean = async (item: HistoryItem) => {
+    if (!item.dataUrl) return;
+    setCleaningId(item.id);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const base64Data = item.dataUrl.split(',')[1];
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: 'image/png', data: base64Data } },
+            { text: "This is a noisy SSTV (Slow Scan Television) image from amateur radio. Please restore it: remove horizontal noise lines, static, and interference streaks. Enhance color clarity and text sharpness (callsigns, names) while keeping the original image content. Output the cleaned image." },
+          ],
+        }
+      });
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData) {
+          const cleanedUrl = `data:image/png;base64,${part.inlineData.data}`;
+          setHistory(prev => {
+            const updated = prev.map(h => h.id === item.id ? { ...h, cleanedDataUrl: cleanedUrl } : h);
+            localStorage.setItem('sstv_history', JSON.stringify(updated));
+            return updated;
+          });
+          break;
+        }
+      }
+    } catch (error) {
+      console.error('AI Cleaning failed:', error);
+    } finally {
+      setCleaningId(null);
+    }
+  };
 
-  const activeModeConfig = MODES[selectedMode === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedMode];
+  const runAIAnalysis = async (item: HistoryItem) => {
+    if (!item.dataUrl) return;
+    setAnalyzingId(item.id);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const imageToAnalyze = item.cleanedDataUrl || item.dataUrl;
+      const base64Data = imageToAnalyze.split(',')[1];
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType: 'image/png', data: base64Data } },
+            { text: "Analyze this SSTV amateur radio image. Extract: 1. Callsign, 2. Operator Name, 3. SSTV Mode, 4. Frequency, 5. RST Report, 6. Location/Grid. Return JSON." },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              callsign: { type: Type.STRING },
+              operatorName: { type: Type.STRING },
+              location: { type: Type.STRING },
+              gridLocator: { type: Type.STRING },
+              report: { type: Type.STRING },
+              frequency: { type: Type.STRING },
+              mode: { type: Type.STRING },
+              technicalDetails: { type: Type.STRING },
+              otherInfo: { type: Type.STRING },
+              rawSummary: { type: Type.STRING },
+            },
+          },
+        },
+      });
+      const analysis: AIAnalysisResult = JSON.parse(response.text || '{}');
+      setHistory(prev => {
+        const updated = prev.map(h => h.id === item.id ? { ...h, aiAnalysis: analysis } : h);
+        localStorage.setItem('sstv_history', JSON.stringify(updated));
+        return updated;
+      });
+    } catch (error) {
+      console.error('AI Analysis failed:', error);
+    } finally {
+      setAnalyzingId(null);
+    }
+  };
+
+  const currentModeData = MODES[selectedMode === SSTVModeId.AUTO ? SSTVModeId.MARTIN1 : selectedMode];
 
   return (
     <div className="min-h-screen p-4 md:p-8 flex flex-col items-center justify-center bg-[#0a0a0c]">
-      <div className="w-full max-w-5xl bg-[#1a202c] border-4 border-gray-700 rounded-xl shadow-2xl overflow-hidden flex flex-col">
-        
-        <div className="bg-gray-800 px-4 py-2 border-b border-gray-700 flex justify-between items-center text-[10px] text-gray-400">
-          <div className="font-bold text-gray-400 uppercase tracking-tighter">WEB-SSTV DECODER ENGINE by Adivor</div>
-          <div className="font-bold text-gray-500 uppercase tracking-widest flex items-center gap-4">
-            <span className="bg-blue-600/20 text-blue-400 px-2 py-0.5 rounded border border-blue-500/20">LIVE RX MONITOR</span>
-            <span>RX-SSTV v3.2.2</span>
+      <div className={`w-full max-w-5xl bg-[#1a202c] border-4 rounded-xl shadow-2xl overflow-hidden flex flex-col transition-all duration-500 ${showSaveFlash ? 'border-blue-400 scale-[1.002]' : 'border-gray-700 hover:border-gray-600'}`}>
+        <div className="bg-gray-800 px-4 py-2 border-b border-gray-700 flex justify-between items-center text-[10px] text-gray-400 font-bold">
+          <div className="uppercase tracking-widest flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+            WebSSTV Decoder v4.0 PRO
+          </div>
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer hover:text-blue-400 transition-colors">
+              <input type="checkbox" checked={autoSave} onChange={e => setAutoSave(e.target.checked)} className="rounded bg-gray-900 border-gray-700 text-blue-500" />
+              AUTO-SAVE
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer hover:text-blue-400 transition-colors">
+              <input type="checkbox" checked={autoStart} onChange={e => setAutoStart(e.target.checked)} className="rounded bg-gray-900 border-gray-700 text-blue-500" />
+              AUTO-MONITOR
+            </label>
           </div>
         </div>
 
-        <div className="bg-gray-750 px-4 py-2 flex gap-4 border-b border-gray-700 overflow-x-auto whitespace-nowrap scrollbar-hide">
+        <div className="bg-gray-750 px-4 py-3 flex gap-4 border-b border-gray-700 overflow-x-auto">
           <button 
             onClick={togglePower}
-            className={`flex items-center gap-2 px-4 py-1 rounded border transition-all flex-shrink-0 ${
-              isActive 
-                ? 'bg-red-900/30 border-red-500 text-red-400 hover:bg-red-900/50' 
-                : 'bg-green-900/30 border-green-500 text-green-400 hover:bg-green-900/50'
+            className={`px-6 py-1.5 rounded-lg border-2 font-black transition-all transform active:scale-95 ${
+              isActive ? 'bg-red-900/40 border-red-500 text-red-400' : 'bg-green-900/40 border-green-500 text-green-400'
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-500 animate-pulse' : 'bg-green-500'}`}></span>
-            {isActive ? 'STOP RX' : 'START RX'}
+            {isActive ? '■ DISCONNECT' : '▶ CONNECT RX'}
           </button>
           
-          <div className="flex items-center gap-2 bg-gray-800 border border-gray-700 px-2 py-1 rounded flex-shrink-0">
-            <span className="text-[9px] text-gray-500 font-bold uppercase tracking-widest mr-1">Input:</span>
-            <select 
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-              disabled={isActive}
-              className="bg-transparent text-[10px] text-gray-300 outline-none border-none cursor-pointer max-w-[150px] disabled:opacity-50"
-            >
-              {devices.map(device => (
-                <option key={device.deviceId} value={device.deviceId} className="bg-gray-800 text-gray-300">
-                  {device.label || `Microphone ${device.deviceId.slice(0, 5)}`}
-                </option>
-              ))}
-              {devices.length === 0 && <option value="">No Devices Found</option>}
-            </select>
-          </div>
-
-          <button 
-            onClick={() => setIsHistoryOpen(true)}
-            className="flex items-center gap-2 bg-gray-800 border border-gray-700 px-3 py-1 rounded text-xs text-gray-400 hover:text-white hover:border-blue-500/50 transition-all group flex-shrink-0"
+          <select 
+            value={selectedDeviceId}
+            onChange={e => setSelectedDeviceId(e.target.value)}
+            disabled={isActive}
+            className="bg-gray-800 border border-gray-700 text-[10px] text-gray-300 rounded-lg px-3 outline-none disabled:opacity-50"
           >
-            <span className="group-hover:scale-110 transition-transform">📚</span>
-            <span>History</span>
-            {history.length > 0 && (
-              <span className="bg-blue-600 text-white px-1.5 py-0 rounded-full text-[9px] font-bold">
-                {history.length}
-              </span>
-            )}
+            {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || 'Audio Input'}</option>)}
+          </select>
+
+          <button onClick={() => setIsHistoryOpen(true)} className="bg-gray-800 border border-gray-700 px-4 py-1.5 rounded-lg text-xs text-gray-300 hover:bg-gray-700 transition-all flex items-center gap-2">
+            📦 LOGBOOK <span className="bg-blue-600 text-white px-1.5 rounded-full text-[9px]">{history.length}</span>
           </button>
-          
-          <div className="flex gap-4 ml-auto items-center flex-shrink-0">
-            {noiseReductionEnabled && (
-              <span className="text-[10px] text-cyan-400 font-bold bg-cyan-900/20 px-2 py-0.5 rounded border border-cyan-500/30">NR ON</span>
-            )}
-            {lmsEnabled && (
-              <span className="text-[10px] text-purple-400 font-bold bg-purple-900/20 px-2 py-0.5 rounded border border-purple-500/30">LMS ACTIVE</span>
-            )}
-            {bpfEnabled && (
-              <span className="text-[10px] text-blue-400 font-bold bg-blue-900/20 px-2 py-0.5 rounded border border-blue-500/30">BPF: {bpfWidth.toUpperCase()}</span>
-            )}
-            {afcEnabled && afcOffset !== 0 && (
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] text-green-500 font-bold uppercase tracking-tighter">AFC OFFSET:</span>
-                <span className="text-[10px] text-white font-mono bg-black px-2 py-0.5 rounded border border-gray-700">
-                  {afcOffset > 0 ? '+' : ''}{afcOffset.toFixed(1)} Hz
-                </span>
-              </div>
-            )}
-          </div>
         </div>
 
         <div className="flex flex-col md:flex-row gap-6 p-6 flex-1 bg-[#1a202c]">
           <div className="flex-1 flex flex-col gap-4">
             <div className="relative group">
-              <div className="absolute -inset-1 bg-gradient-to-r from-blue-600 to-cyan-600 rounded-lg blur opacity-25 group-hover:opacity-50 transition duration-1000"></div>
-              <div className="relative crt-screen bg-black overflow-hidden flex items-center justify-center aspect-[4/3]">
+              <div className="absolute -inset-1 bg-gradient-to-r from-blue-600 to-indigo-600 rounded-lg blur opacity-10 group-hover:opacity-20 transition duration-1000"></div>
+              <div className="relative crt-screen bg-[#050505] overflow-hidden aspect-[4/3] flex items-center justify-center shadow-inner">
+                <div className="scanline"></div>
                 <canvas 
                   ref={canvasRef} 
-                  className="max-w-full max-h-full object-contain image-pixelated"
+                  className="w-full h-full object-contain image-pixelated transition-all duration-300"
                   style={{ imageRendering: 'pixelated' }}
                 />
-                {!isActive && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 text-center">
-                    <div className="text-blue-400 text-4xl mb-4 opacity-20">(((📡)))</div>
-                    <p className="text-gray-500 text-sm max-w-xs px-4">Press Start to begin listening for SSTV signals</p>
+                
+                {isCleaningCurrent && (
+                  <div className="absolute inset-0 bg-cyan-900/40 backdrop-blur-sm z-40 flex flex-col items-center justify-center animate-in fade-in duration-300">
+                    <div className="w-full h-1 bg-cyan-500 absolute top-0 animate-[scan_1s_infinite] shadow-[0_0_20px_cyan]"></div>
+                    <div className="w-12 h-12 border-4 border-cyan-500/30 border-t-cyan-500 rounded-full animate-spin mb-4"></div>
+                    <span className="text-xs font-black text-cyan-400 uppercase tracking-[0.2em] bg-black/80 px-4 py-2 rounded-lg border border-cyan-500/50">AI RESTORATION IN PROGRESS</span>
                   </div>
                 )}
-                {isActive && status === DecoderStatus.LISTENING && (
-                  <div className="absolute top-4 left-4 flex flex-col gap-2">
-                    <div className="flex items-center gap-2 bg-black/40 px-3 py-1 rounded border border-green-500/30 shadow-lg">
-                      <div className="w-2 h-2 bg-green-500 rounded-full animate-ping"></div>
-                      <span className="text-green-500 text-[10px] font-bold tracking-widest uppercase">Sync Search...</span>
+
+                {showSaveFlash && (
+                  <div className="absolute inset-0 bg-blue-500/10 pointer-events-none animate-pulse z-30 flex items-center justify-center">
+                    <div className="bg-blue-600 text-white px-4 py-2 rounded-full font-black text-xs shadow-2xl border border-blue-400">IMAGE SAVED TO LOG</div>
+                  </div>
+                )}
+
+                <div className="absolute inset-0 pointer-events-none p-4 flex flex-col justify-between">
+                  <div className="flex justify-between items-start">
+                    <div className="bg-black/60 backdrop-blur-md border border-gray-700 p-2 rounded text-[10px] font-mono text-cyan-400 uppercase">
+                      <div className="opacity-50 text-[8px]">Current Mode</div>
+                      <div className="font-bold text-sm">{selectedMode}</div>
+                    </div>
+                    {status === DecoderStatus.RECEIVING && (
+                      <div className="bg-red-600 text-white px-2 py-1 rounded text-[10px] font-black animate-pulse flex items-center gap-2">
+                        <span className="w-2 h-2 rounded-full bg-white"></span> RECEIVING
+                      </div>
+                    )}
+                    {status === DecoderStatus.LISTENING && (
+                      <div className="bg-blue-600/20 border border-blue-500/50 text-blue-400 px-2 py-1 rounded text-[10px] font-bold animate-pulse">
+                        AUTO-SCANNING...
+                      </div>
+                    )}
+                  </div>
+                  {!isActive && (
+                    <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-4 z-20">
+                      <p className="text-gray-500 text-sm font-bold uppercase tracking-widest animate-pulse">System Offline</p>
+                      <button onClick={togglePower} className="mt-4 px-4 py-2 bg-blue-600/20 border border-blue-500 text-blue-400 text-[10px] rounded hover:bg-blue-600/40 transition-all pointer-events-auto">INITIALIZE LINK</button>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-end z-20">
+                    <div className="text-[10px] font-mono text-gray-500 bg-black/40 px-2 py-1 rounded border border-gray-800/50">
+                      SCAN: {currentLineDisplay}/{currentModeData.height}
+                    </div>
+                    <div className="text-[10px] font-mono text-gray-500 bg-black/40 px-2 py-1 rounded border border-gray-800/50">
+                      SYNC: <span className={syncDetectedInLineRef.current ? 'text-green-500' : 'text-gray-500'}>{syncDetectedInLineRef.current ? 'LOCKED' : 'WAITING'}</span>
                     </div>
                   </div>
-                )}
-                {status === DecoderStatus.RECEIVING && (
-                   <div className="absolute top-4 right-4 bg-black/70 px-3 py-1.5 rounded border border-blue-500/30 text-[10px] font-mono text-blue-400 flex flex-col items-end shadow-xl">
-                     <span className="text-blue-200">LINE: {currentLineDisplay} / {activeModeConfig.height}</span>
-                     <span className="font-bold">PROGRESS: {Math.round(progress)}%</span>
-                   </div>
-                )}
+                </div>
               </div>
             </div>
-            
-            <div className="flex justify-end items-center bg-gray-800/50 p-2 rounded border border-gray-700">
-               <div className="flex gap-2">
-                 <button 
-                  onClick={saveToHistory}
-                  disabled={progress < 5} 
-                  className="px-3 py-1 bg-blue-600 text-[10px] rounded hover:bg-blue-500 text-white font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                 >
-                   💾 SAVE FRAME
-                 </button>
-                 <button 
-                  onClick={() => {
-                    const canvas = canvasRef.current;
-                    if (canvas) {
-                      const ctx = canvas.getContext('2d');
-                      ctx?.clearRect(0, 0, canvas.width, canvas.height);
-                      ctx!.fillStyle = '#000';
-                      ctx!.fillRect(0, 0, canvas.width, canvas.height);
-                    }
-                    setProgress(0);
-                    setCurrentLineDisplay(0);
-                  }}
-                  className="px-3 py-1 bg-gray-700 text-[10px] rounded hover:bg-gray-600 text-gray-300 font-bold transition-colors"
-                 >
-                   🗑 CLEAR
-                 </button>
-               </div>
+
+            <div className="bg-gray-900/50 p-4 rounded-xl border border-gray-800 flex items-center justify-between gap-6">
+              <div className="flex-1">
+                <div className="flex justify-between text-[10px] font-bold text-gray-500 mb-2 uppercase tracking-tighter">
+                  <span>Image Reconstruction</span>
+                  <span className="text-blue-400">{Math.round(progress)}%</span>
+                </div>
+                <div className="h-2 bg-gray-800 rounded-full overflow-hidden border border-gray-700">
+                  <div 
+                    className="h-full bg-gradient-to-r from-blue-700 to-cyan-400 transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {status === DecoderStatus.RECEIVING ? (
+                  <button 
+                    onClick={stopDecoding}
+                    className="px-4 py-1.5 bg-red-600 text-white rounded-lg font-bold text-[10px] hover:bg-red-500 transition-all shadow-lg shadow-red-900/20"
+                  >
+                    STOP RX
+                  </button>
+                ) : (
+                  <button 
+                    onClick={() => {
+                      if(status === DecoderStatus.IDLE) setStatus(DecoderStatus.LISTENING);
+                      startDecoding(selectedMode);
+                    }}
+                    disabled={!isActive}
+                    className="px-4 py-1.5 bg-amber-600 text-white rounded-lg font-bold text-[10px] hover:bg-amber-500 disabled:opacity-30 transition-all shadow-lg shadow-amber-900/20"
+                  >
+                    MANUAL RX
+                  </button>
+                )}
+                
+                <button 
+                  onClick={runAICleanCurrent} 
+                  disabled={!isActive || progress < 5 || isCleaningCurrent} 
+                  className="px-4 py-1.5 bg-cyan-700 text-white rounded-lg font-bold text-[10px] hover:bg-cyan-600 disabled:opacity-30 transition-all shadow-lg shadow-cyan-900/40 border border-cyan-500 flex items-center gap-2"
+                >
+                  {isCleaningCurrent ? 'CLEANING...' : '✨ AI CLEAN'}
+                </button>
+
+                <button 
+                  onClick={saveToHistory} 
+                  disabled={progress < 2} 
+                  className="px-4 py-1.5 bg-blue-600 text-white rounded-lg font-bold text-[10px] hover:bg-blue-500 disabled:opacity-30 transition-all shadow-lg shadow-blue-900/20"
+                >
+                  CAPTURE
+                </button>
+              </div>
             </div>
           </div>
 
-          <div className="w-full md:w-80 flex flex-col gap-4">
-            <SignalIndicator frequency={signal.freq} level={signal.level} fftData={fftData} />
-            <div className="p-4 bg-gray-900 rounded-lg border border-gray-700 flex flex-col gap-2">
-              <div className="flex justify-between items-center">
-                <span className="text-xs font-bold text-gray-400 uppercase tracking-tighter">Scanline Progress</span>
-                <span className={`text-[10px] font-bold ${status === DecoderStatus.RECEIVING ? 'text-blue-400' : 'text-gray-600'}`}>
-                  {Math.round(progress)}%
-                </span>
-              </div>
-              <div className="flex gap-1 h-3">
-                {Array.from({ length: 20 }).map((_, i) => (
-                  <div 
-                    key={i}
-                    className={`flex-1 rounded-sm transition-all duration-300 ${
-                      progress > (i / 20) * 100 ? 'bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.6)]' : 'bg-gray-800'
-                    }`}
-                  />
-                ))}
-              </div>
-            </div>
-            
+          <div className="w-full md:w-80 flex flex-col gap-6">
+            <SignalIndicator 
+              frequency={signal.freq} 
+              level={signal.level} 
+              fftData={fftData} 
+              gain={inputGain}
+              onGainChange={setInputGain}
+            />
             <ModeSelector 
-              selectedMode={selectedMode} 
-              onSelect={handleModeSelect} 
-              status={status}
-              afcEnabled={afcEnabled}
-              onToggleAfc={() => setAfcEnabled(!afcEnabled)}
-              lmsEnabled={lmsEnabled}
-              onToggleLms={() => setLmsEnabled(!lmsEnabled)}
-              bpfEnabled={bpfEnabled}
-              onToggleBpf={() => setBpfEnabled(!bpfEnabled)}
-              bpfWidth={bpfWidth}
-              onChangeBpfWidth={setBpfWidth}
-              noiseReductionEnabled={noiseReductionEnabled}
-              onToggleNoiseReduction={() => setNoiseReductionEnabled(!noiseReductionEnabled)}
+              selectedMode={selectedMode} onSelect={setSelectedMode} status={status}
+              afcEnabled={afcEnabled} onToggleAfc={() => setAfcEnabled(!afcEnabled)}
+              lmsEnabled={lmsEnabled} onToggleLms={() => setLmsEnabled(!lmsEnabled)}
+              bpfEnabled={bpfEnabled} onToggleBpf={() => setBpfEnabled(!bpfEnabled)}
+              bpfFrequency={bpfFrequency} onBpfFrequencyChange={setBpfFrequency}
+              bpfQ={bpfQ} onBpfQChange={setBpfQ}
+              noiseReductionEnabled={noiseReductionEnabled} onToggleNoiseReduction={() => setNoiseReductionEnabled(!noiseReductionEnabled)}
             />
           </div>
-        </div>
-
-        <div className="bg-blue-600 px-4 py-1 flex justify-between items-center text-[10px] text-white font-bold">
-           <div className="flex gap-4">
-             <span>STATUS: {isActive ? 'ACTIVE' : 'READY'}</span>
-             <span>MODE: {selectedMode}</span>
-           </div>
-           <div className="flex items-center gap-4">
-              <span className="uppercase tracking-widest">{status}</span>
-           </div>
         </div>
       </div>
 
       <HistoryModal 
-        isOpen={isHistoryOpen}
-        onClose={() => setIsHistoryOpen(false)}
-        items={history}
-        onDelete={deleteFromHistory}
-        onDownload={downloadHistoryItem}
-        onClear={clearHistory}
-        onAnalyze={runAIAnalysis}
+        isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} items={history}
+        onDelete={id => setHistory(prev => {
+          const updated = prev.filter(i => i.id !== id);
+          localStorage.setItem('sstv_history', JSON.stringify(updated));
+          return updated;
+        })}
+        onDownload={item => { 
+          const l = document.createElement('a'); 
+          l.download = `sstv_${item.id}.png`; 
+          l.href = item.cleanedDataUrl || item.dataUrl; 
+          l.click(); 
+        }}
+        onClear={() => { 
+          if(confirm('Purge Logbook?')) {
+            setHistory([]);
+            localStorage.removeItem('sstv_history');
+          }
+        }}
+        onAnalyze={runAIAnalysis} 
+        onClean={runAIClean}
         analyzingId={analyzingId}
+        cleaningId={cleaningId}
       />
+      <style>{`@keyframes scan { 0% { top: 0; } 100% { top: 100%; } }`}</style>
     </div>
   );
 };

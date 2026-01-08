@@ -12,8 +12,10 @@ interface ModeSelectorProps {
   onToggleLms: () => void;
   bpfEnabled: boolean;
   onToggleBpf: () => void;
-  bpfWidth: 'narrow' | 'medium' | 'wide';
-  onChangeBpfWidth: (width: 'narrow' | 'medium' | 'wide') => void;
+  bpfFrequency: number;
+  onBpfFrequencyChange: (val: number) => void;
+  bpfQ: number;
+  onBpfQChange: (val: number) => void;
   noiseReductionEnabled: boolean;
   onToggleNoiseReduction: () => void;
 }
@@ -28,8 +30,10 @@ export const ModeSelector: React.FC<ModeSelectorProps> = ({
   onToggleLms,
   bpfEnabled,
   onToggleBpf,
-  bpfWidth,
-  onChangeBpfWidth,
+  bpfFrequency,
+  onBpfFrequencyChange,
+  bpfQ,
+  onBpfQChange,
   noiseReductionEnabled,
   onToggleNoiseReduction
 }) => {
@@ -111,7 +115,7 @@ export const ModeSelector: React.FC<ModeSelectorProps> = ({
           NOISE REDUCTION (LPF) {noiseReductionEnabled ? 'ON' : 'OFF'}
         </button>
 
-        <div className="flex flex-col gap-1 border border-gray-800 p-1.5 rounded bg-black/20">
+        <div className="flex flex-col gap-1 border border-gray-800 p-2.5 rounded bg-black/20">
           <button 
             onClick={onToggleBpf}
             className={`w-full border text-[10px] py-1 rounded transition-colors font-bold ${
@@ -124,20 +128,63 @@ export const ModeSelector: React.FC<ModeSelectorProps> = ({
           </button>
           
           {bpfEnabled && (
-            <div className="flex gap-1 mt-1">
-              {(['narrow', 'medium', 'wide'] as const).map(w => (
-                <button
-                  key={w}
-                  onClick={() => onChangeBpfWidth(w)}
-                  className={`flex-1 text-[8px] py-0.5 rounded border uppercase transition-all ${
-                    bpfWidth === w 
-                      ? 'bg-blue-900 border-blue-500 text-blue-200' 
-                      : 'bg-gray-900 border-gray-800 text-gray-600 hover:text-gray-400'
-                  }`}
+            <div className="flex flex-col gap-3 mt-3 animate-in slide-in-from-top-1 duration-200">
+              <div className="space-y-1">
+                <div className="flex justify-between text-[8px] font-bold text-gray-500 uppercase">
+                  <span>Center Freq</span>
+                  <span className="text-blue-400">{bpfFrequency} Hz</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="800" 
+                  max="3000" 
+                  step="10"
+                  value={bpfFrequency} 
+                  onChange={(e) => onBpfFrequencyChange(parseInt(e.target.value))}
+                  className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between text-[8px] font-bold text-gray-500 uppercase">
+                  <span>Q Factor (Bandwidth)</span>
+                  <span className="text-blue-400">{bpfQ.toFixed(1)}</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="0.1" 
+                  max="20.0" 
+                  step="0.1"
+                  value={bpfQ} 
+                  onChange={(e) => onBpfQChange(parseFloat(e.target.value))}
+                  className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                />
+                <div className="flex justify-between text-[7px] text-gray-600 font-bold px-0.5">
+                  <span>WIDE (0.1)</span>
+                  <span>SHARP (20.0)</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1 mt-1">
+                <button 
+                  onClick={() => { onBpfFrequencyChange(1750); onBpfQChange(1.5); }}
+                  className="text-[7px] bg-gray-800 border border-gray-700 text-gray-400 py-1 rounded hover:bg-gray-700 font-bold"
                 >
-                  {w}
+                  RESET STD
                 </button>
-              ))}
+                <button 
+                  onClick={() => onBpfFrequencyChange(1200)}
+                  className="text-[7px] bg-gray-800 border border-gray-700 text-gray-400 py-1 rounded hover:bg-gray-700 font-bold"
+                >
+                  SYNC ONLY
+                </button>
+                <button 
+                  onClick={() => onBpfFrequencyChange(1900)}
+                  className="text-[7px] bg-gray-800 border border-gray-700 text-gray-400 py-1 rounded hover:bg-gray-700 font-bold"
+                >
+                  VIDEO ONLY
+                </button>
+              </div>
             </div>
           )}
         </div>
