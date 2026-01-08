@@ -29,11 +29,20 @@ export const MODES: Record<string, SSTVModeConfig> = {
     numChannels: 3,
     visCode: 60
   },
+  [SSTVModeId.SCOTTIE2]: {
+    id: SSTVModeId.SCOTTIE2,
+    width: 320,
+    height: 256,
+    lineTime: 72.032,
+    syncTime: 9.0,
+    numChannels: 3,
+    visCode: 56
+  },
   [SSTVModeId.ROBOT36]: {
     id: SSTVModeId.ROBOT36,
     width: 320,
     height: 240,
-    lineTime: 150, // Simplified for example
+    lineTime: 150,
     syncTime: 9.0,
     numChannels: 3,
     visCode: 8
@@ -42,7 +51,7 @@ export const MODES: Record<string, SSTVModeConfig> = {
     id: SSTVModeId.PD120,
     width: 640,
     height: 480,
-    lineTime: 250, // Simplified
+    lineTime: 250,
     syncTime: 20,
     numChannels: 3,
     visCode: 95

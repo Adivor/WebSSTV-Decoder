@@ -36,6 +36,9 @@ export interface AIAnalysisResult {
   operatorName?: string;
   location?: string;
   report?: string;
+  frequency?: string;
+  mode?: string;
+  technicalDetails?: string;
   otherInfo?: string;
   rawSummary?: string;
 }
