@@ -1,0 +1,7 @@
+{
+  "name": "WebSSTV Decoder",
+  "description": "A modern, browser-based SSTV (Slow Scan Television) decoder for amateur radio, featuring auto-mode detection and real-time audio processing.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
